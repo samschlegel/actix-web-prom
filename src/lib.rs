@@ -213,7 +213,8 @@ use actix_service::{Service, Transform};
 use actix_web::{
     dev::{Body, BodySize, MessageBody, ResponseBody, ServiceRequest, ServiceResponse},
     http::{Method, StatusCode},
-    web::Bytes,
+    http::header,
+    web::{Bytes, HttpResponse},
     Error,
 };
 use futures::{
@@ -381,33 +382,45 @@ where
     fn call(&mut self, req: ServiceRequest) -> Self::Future {
         let inner = self.inner.clone();
         let clock = SystemTime::now();
-        let fut = self.service.call(req);
-        Box::pin(async move {
-            let res = fut.await?;
-            let req = res.request();
-            let method = req.method().clone();
-            let path = req.path().to_string();
+        let path = req.path().to_string();
+        let method = req.method().clone();
 
-            Ok(res.map_body(move |mut head, mut body| {
-                // We short circuit the response status and body to serve the endpoint
-                // automagically. This way the user does not need to set the middleware *AND*
-                // an endpoint to serve middleware results. The user is only required to set
-                // the middleware and tell us what the endpoint should be.
-                if inner.matches(&path, &method) {
-                    head.status = StatusCode::OK;
-                    body = ResponseBody::Other(Body::from_message(inner.metrics()));
-                }
-                ResponseBody::Body(StreamLog {
-                    body,
-                    size: 0,
-                    clock,
-                    inner,
-                    status: head.status,
-                    path,
-                    method,
-                })
-            }))
-        })
+        if inner.matches(&path, &method) {
+            Box::pin(async move {
+                let mut builder = HttpResponse::Ok();
+                builder.set(header::ContentType::plaintext());
+                let http_res = builder.body(Body::from_message(inner.metrics())).into_body();
+                let svc_res = req.into_response(http_res);
+                Ok(svc_res.map_body(move |head, body| {
+                    ResponseBody::Body(StreamLog {
+                        body,
+                        size: 0,
+                        clock,
+                        inner,
+                        status: head.status,
+                        path,
+                        method,
+                    })
+                }))
+            })
+        } else {
+            let fut = self.service.call(req);
+            Box::pin(async move {
+                let res = fut.await?;
+                Ok(res.map_body(move |head, body| {
+                    ResponseBody::Body(StreamLog {
+                        body,
+                        size: 0,
+                        clock,
+                        inner,
+                        status: head.status,
+                        path,
+                        method,
+                    })
+                }))
+            })
+        }
+
     }
 }
 
@@ -450,7 +463,7 @@ impl<B: MessageBody> MessageBody for StreamLog<B> {
 mod tests {
     use super::*;
     use actix_web::test::{call_service, init_service, read_body, read_response, TestRequest};
-    use actix_web::{web, App, HttpResponse};
+    use actix_web::{web, App, HttpResponse, http::HeaderValue};
 
     use prometheus::{Counter, Opts};
 
@@ -715,5 +728,32 @@ actix_web_prom_http_requests_total{endpoint=\"/health_check\",label1=\"value1\",
             )
             .unwrap()
         ));
+    }
+
+    #[actix_rt::test]
+    async fn middleware_response_content_type() {
+        let prometheus = PrometheusMetrics::new("actix_web_prom", Some("/metrics"), None);
+
+        let mut app = init_service(
+            App::new()
+                .wrap(prometheus),
+        )
+        .await;
+
+        let res = call_service(
+            &mut app,
+            TestRequest::with_uri("/metrics").to_request(),
+        )
+        .await;
+        assert!(res.status().is_success());
+        assert_eq!(res.headers().get(header::CONTENT_TYPE), Some(&HeaderValue::from_static("text/plain; charset=utf-8")));
+        assert_eq!(read_body(res).await, "");
+    }
+
+    #[actix_rt::test]
+    async fn middleware_doesnt_call_underlying_metrics_service() {
+        // TODO: Write this test
+        // The way that the middleware was written, if a /metrics service was registered underneath, it would call it and throw away the response
+        // This is surprising and imo bad behavior
     }
 }
